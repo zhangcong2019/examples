@@ -21,6 +21,8 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+import intel_extension_for_pytorch as ipex
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -190,13 +192,16 @@ def main_worker(gpu, ngpus_per_node, args):
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
-        device = torch.device("cpu")
+        device = torch.device("xpu")
+        model = model.to(device)
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+    model, optimizer = ipex.optimize(model, optimizer=optimizer, dtype=torch.float32,
+    level="O1")
     
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
@@ -272,15 +277,18 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
-
+    totaltime = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        t = time.time()
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, device, args)
 
         # evaluate on validation set
+        totaltime += time.time() - t
+        print(f"###Time used: {totaltime} seconds")
         acc1 = validate(val_loader, model, criterion, args)
         
         scheduler.step()
@@ -311,9 +319,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         len(train_loader),
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
-
     # switch to train mode
     model.train()
+    # model, optimizer = ipex.optimize(model, optimizer=optimizer, dtype=torch.float32,
+    # level="O1")
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -361,7 +370,9 @@ def validate(val_loader, model, criterion, args):
                     target = target.to('mps')
                 if torch.cuda.is_available():
                     target = target.cuda(args.gpu, non_blocking=True)
-
+                
+                images = images.to('xpu', non_blocking=True)
+                target = target.to('xpu', non_blocking=True)
                 # compute output
                 output = model(images)
                 loss = criterion(output, target)
@@ -390,6 +401,7 @@ def validate(val_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
+    # model = ipex.optimize(model, dtype=torch.float32)
 
     run_validate(val_loader)
     if args.distributed:
